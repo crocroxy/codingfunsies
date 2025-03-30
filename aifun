@@ -1,0 +1,543 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using Discord;
+using Discord.Commands;
+using Discord.WebSocket;
+using Microsoft.Extensions.DependencyInjection;
+using Newtonsoft.Json;
+using ConnectionState = Discord.ConnectionState;
+using Formatting = Newtonsoft.Json.Formatting;
+
+namespace DiscordBotConsole
+{
+    class Program
+    {
+        private DiscordSocketClient _client;
+        private CommandService _commands;
+        private IServiceProvider _services;
+        private BotConfig _config;
+        private GamblingStats _stats;
+        private string _configPath = "config.json";
+        private string _statsPath = "gambling_stats.json";
+        private Random _random = new Random();
+        private bool _connectionSuccessful = false;
+        private TaskCompletionSource<bool> _connectionTaskSource;
+
+        static void Main(string[] args)
+        {
+            try
+            {
+                new Program().MainAsync().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Fatal error: {ex.Message}");
+                Console.WriteLine("Press any key to exit...");
+                Console.ReadKey();
+            }
+        }
+
+        public async Task MainAsync()
+        {
+            // Load or create config first and ensure we have a token
+            await EnsureConfigWithTokenAsync();
+            LoadOrCreateStats();
+
+            // Configure the client with optimized socket settings
+            var socketConfig = new DiscordSocketConfig
+            {
+                GatewayIntents = GatewayIntents.MessageContent | GatewayIntents.GuildMessages | GatewayIntents.Guilds,
+                AlwaysDownloadUsers = false,
+                MessageCacheSize = 50,
+                ConnectionTimeout = 15000, // 15 seconds
+                DefaultRetryMode = RetryMode.RetryRatelimit,
+                LogLevel = LogSeverity.Error // Only log errors
+            };
+
+            _client = new DiscordSocketClient(socketConfig);
+            _commands = new CommandService();
+            _services = new ServiceCollection()
+                .AddSingleton(_client)
+                .AddSingleton(_commands)
+                .BuildServiceProvider();
+
+            // Set up event handlers with clear logging
+            _client.Log += ClientLogAsync;
+            _client.MessageReceived += HandleCommandAsync;
+            _client.Connected += () => {
+                _connectionSuccessful = true;
+                _connectionTaskSource.TrySetResult(true);
+                return Task.CompletedTask;
+            };
+            _client.Disconnected += (ex) => {
+                if (!_connectionSuccessful)
+                {
+                    _connectionTaskSource.TrySetResult(false);
+                }
+                return Task.CompletedTask;
+            };
+
+            Console.WriteLine("Connecting to Discord...");
+
+            try
+            {
+                _connectionTaskSource = new TaskCompletionSource<bool>();
+
+                // First try to login
+                await _client.LoginAsync(TokenType.Bot, _config.Token);
+
+                // Then start the client
+                await _client.StartAsync();
+
+                // Wait for either connected or disconnected event with timeout
+                using (var cts = new CancellationTokenSource())
+                {
+                    var timeoutTask = Task.Delay(20000, cts.Token); // 20 second timeout
+                    var completedTask = await Task.WhenAny(_connectionTaskSource.Task, timeoutTask);
+
+                    if (completedTask == timeoutTask)
+                    {
+                        Console.WriteLine("Connection timed out. Please check your token and internet connection.");
+                        await _client.StopAsync();
+                        await Task.Delay(2000); // Give it time to clean up
+                        Environment.Exit(1);
+                        return;
+                    }
+
+                    cts.Cancel(); // Cancel the timeout task
+                }
+
+                if (!_connectionSuccessful)
+                {
+                    Console.WriteLine("Connection wasn't successful. Please check your token and internet connection.");
+                    Console.WriteLine("Would you like to try again with a different token? (y/n): ");
+                    string retry = Console.ReadLine().ToLower();
+                    if (retry == "y" || retry == "yes")
+                    {
+                        await _client.StopAsync();
+                        await PromptForTokenAsync();
+                        // Restart the application to try with the new token
+                        System.Diagnostics.Process.Start(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName);
+                        Environment.Exit(0);
+                        return;
+                    }
+
+                    await _client.StopAsync();
+                    await Task.Delay(2000); // Give it time to clean up
+                    Environment.Exit(1);
+                    return;
+                }
+
+                Console.WriteLine("Connected successfully!");
+                await Task.Delay(1000); // Short pause to show connection success message
+
+                // Run the dashboard
+                await RunDashboardAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Connection error: {ex.Message}");
+                Console.WriteLine("Would you like to try again with a different token? (y/n): ");
+                string retry = Console.ReadLine().ToLower();
+                if (retry == "y" || retry == "yes")
+                {
+                    if (_client != null)
+                    {
+                        await _client.StopAsync();
+                    }
+                    await PromptForTokenAsync();
+                    // Restart the application to try with the new token
+                    System.Diagnostics.Process.Start(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName);
+                    Environment.Exit(0);
+                    return;
+                }
+
+                if (_client != null)
+                {
+                    await _client.StopAsync();
+                }
+                await Task.Delay(2000); // Give it time to clean up
+                Environment.Exit(1);
+                return;
+            }
+        }
+
+        private async Task EnsureConfigWithTokenAsync()
+        {
+            // Load existing config if available
+            if (File.Exists(_configPath))
+            {
+                string json = File.ReadAllText(_configPath);
+                _config = JsonConvert.DeserializeObject<BotConfig>(json);
+
+                // Check if token is empty or invalid (e.g., placeholder)
+                if (string.IsNullOrWhiteSpace(_config.Token))
+                {
+                    await PromptForTokenAsync();
+                }
+                else
+                {
+                    Console.WriteLine("Token found in configuration file.");
+                    Console.WriteLine("Would you like to use the existing token or enter a new one?");
+                    Console.WriteLine("1. Use existing token");
+                    Console.WriteLine("2. Enter new token");
+                    Console.Write("Selection: ");
+
+                    string choice = Console.ReadLine().Trim();
+                    if (choice == "2")
+                    {
+                        await PromptForTokenAsync();
+                    }
+                }
+            }
+            else
+            {
+                // Create new config with empty values
+                _config = new BotConfig
+                {
+                    Token = "",
+                    CommandPrefix = "."
+                };
+
+                // Always prompt for token if config doesn't exist
+                await PromptForTokenAsync();
+            }
+        }
+
+        private async Task PromptForTokenAsync()
+        {
+            Console.Clear();
+            Console.WriteLine("=== Discord Bot Token Setup ===");
+            Console.WriteLine("Please enter your Discord bot token:");
+            Console.WriteLine("(You can find this in the Discord Developer Portal: https://discord.com/developers/applications)");
+            Console.Write("> ");
+
+            _config.Token = Console.ReadLine().Trim();
+
+            while (string.IsNullOrWhiteSpace(_config.Token))
+            {
+                Console.WriteLine("Token cannot be empty. Please enter a valid token:");
+                Console.Write("> ");
+                _config.Token = Console.ReadLine().Trim();
+            }
+
+            SaveConfig();
+            Console.WriteLine("Token saved successfully!");
+            await Task.Delay(1000); // Short pause to show the success message
+        }
+
+        private Task ClientLogAsync(LogMessage log)
+        {
+            // Show important messages only
+            if (log.Severity <= LogSeverity.Error)
+            {
+                // Skip gateway connect/disconnect messages
+                if (!log.Message.Contains("Gateway") &&
+                    !log.Message.Contains("Heartbeat") &&
+                    !log.Message.Contains("Connection"))
+                {
+                    Console.WriteLine($"Discord Log: {log.Message}");
+                }
+            }
+            return Task.CompletedTask;
+        }
+
+        private async Task RunDashboardAsync()
+        {
+            bool running = true;
+            while (running)
+            {
+                Console.Clear();
+                Console.WriteLine("=== Discord Bot Dashboard ===");
+                Console.WriteLine($"Bot Status: {(_client.ConnectionState == ConnectionState.Connected ? "Connected" : "Disconnected")}");
+                Console.WriteLine($"Prefix: {_config.CommandPrefix}");
+                Console.WriteLine($"Total Gambles: {_stats.TotalGambles}");
+                Console.WriteLine($"Total Wins: {_stats.TotalWins}");
+                Console.WriteLine($"Total Losses: {_stats.TotalLosses}");
+                Console.WriteLine("===========================");
+                Console.WriteLine("1. Change Command Prefix");
+                Console.WriteLine("2. View User Statistics");
+                Console.WriteLine("3. Reset All Statistics");
+                Console.WriteLine("4. Change Bot Token");
+                Console.WriteLine("5. Exit");
+                Console.WriteLine("===========================");
+                Console.Write("Select an option: ");
+
+                string input = Console.ReadLine();
+                switch (input)
+                {
+                    case "1":
+                        await ChangeCommandPrefixAsync();
+                        break;
+                    case "2":
+                        await ViewUserStatisticsAsync();
+                        break;
+                    case "3":
+                        await ResetAllStatisticsAsync();
+                        break;
+                    case "4":
+                        await ChangeBotTokenAsync();
+                        break;
+                    case "5":
+                        running = false;
+                        await _client.StopAsync();
+                        break;
+                    default:
+                        Console.WriteLine("Invalid option. Press any key to continue...");
+                        Console.ReadKey();
+                        break;
+                }
+            }
+        }
+
+        private async Task ChangeCommandPrefixAsync()
+        {
+            Console.Clear();
+            Console.WriteLine("=== Change Command Prefix ===");
+            Console.WriteLine($"Current prefix: {_config.CommandPrefix}");
+            Console.Write("Enter new prefix: ");
+            string newPrefix = Console.ReadLine();
+
+            if (!string.IsNullOrWhiteSpace(newPrefix))
+            {
+                _config.CommandPrefix = newPrefix;
+                SaveConfig();
+                Console.WriteLine($"Prefix changed to: {newPrefix}");
+            }
+            else
+            {
+                Console.WriteLine("Prefix cannot be empty.");
+            }
+
+            Console.WriteLine("Press any key to continue...");
+            Console.ReadKey();
+            await Task.CompletedTask;
+        }
+
+        private async Task ViewUserStatisticsAsync()
+        {
+            Console.Clear();
+            Console.WriteLine("=== User Gambling Statistics ===");
+
+            if (_stats.UserStats.Count == 0)
+            {
+                Console.WriteLine("No statistics available yet.");
+            }
+            else
+            {
+                foreach (var user in _stats.UserStats)
+                {
+                    Console.WriteLine($"User ID: {user.Key}");
+                    Console.WriteLine($"  Wins: {user.Value.Wins}");
+                    Console.WriteLine($"  Losses: {user.Value.Losses}");
+                    Console.WriteLine($"  Win Rate: {(user.Value.Wins + user.Value.Losses > 0 ? (double)user.Value.Wins / (user.Value.Wins + user.Value.Losses) * 100 : 0):F2}%");
+                    Console.WriteLine("---------------------------");
+                }
+            }
+
+            Console.WriteLine("Press any key to continue...");
+            Console.ReadKey();
+            await Task.CompletedTask;
+        }
+
+        private async Task ResetAllStatisticsAsync()
+        {
+            Console.Clear();
+            Console.WriteLine("=== Reset All Statistics ===");
+            Console.Write("Are you sure you want to reset all statistics? (y/n): ");
+            string confirm = Console.ReadLine().ToLower();
+
+            if (confirm == "y" || confirm == "yes")
+            {
+                _stats = new GamblingStats();
+                SaveStats();
+                Console.WriteLine("All statistics have been reset.");
+            }
+            else
+            {
+                Console.WriteLine("Reset cancelled.");
+            }
+
+            Console.WriteLine("Press any key to continue...");
+            Console.ReadKey();
+            await Task.CompletedTask;
+        }
+
+        private async Task ChangeBotTokenAsync()
+        {
+            Console.Clear();
+            Console.WriteLine("=== Change Bot Token ===");
+            Console.Write("Enter new token: ");
+            string newToken = Console.ReadLine();
+
+            if (!string.IsNullOrWhiteSpace(newToken))
+            {
+                _config.Token = newToken;
+                SaveConfig();
+                Console.WriteLine("Token updated. Reconnecting bot...");
+
+                await _client.StopAsync();
+
+                _connectionSuccessful = false;
+                _connectionTaskSource = new TaskCompletionSource<bool>();
+
+                try
+                {
+                    await _client.LoginAsync(TokenType.Bot, newToken);
+                    await _client.StartAsync();
+
+                    // Wait up to 10 seconds for connection
+                    using (var cts = new CancellationTokenSource())
+                    {
+                        var timeoutTask = Task.Delay(10000, cts.Token);
+                        var completedTask = await Task.WhenAny(_connectionTaskSource.Task, timeoutTask);
+
+                        if (completedTask == timeoutTask || !_connectionSuccessful)
+                        {
+                            Console.WriteLine("Reconnection failed. The token may be invalid.");
+                        }
+                        else
+                        {
+                            Console.WriteLine("Reconnected successfully.");
+                        }
+
+                        cts.Cancel();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to reconnect: {ex.Message}");
+                }
+            }
+            else
+            {
+                Console.WriteLine("Token cannot be empty.");
+            }
+
+            Console.WriteLine("Press any key to continue...");
+            Console.ReadKey();
+        }
+
+        private async Task HandleCommandAsync(SocketMessage messageParam)
+        {
+            // Don't process the command if it was a system message
+            if (!(messageParam is SocketUserMessage message)) return;
+
+            // Create a number to track where the prefix ends and the command begins
+            int argPos = 0;
+
+            // Check if the message starts with the command prefix or mentions the bot
+            if (!(message.HasStringPrefix(_config.CommandPrefix, ref argPos) ||
+                  message.HasMentionPrefix(_client.CurrentUser, ref argPos)))
+                return;
+
+            // Handle .gamble command
+            string command = message.Content.Substring(argPos).Split(' ')[0].ToLower();
+            if (command == "gamble")
+            {
+                await HandleGambleCommand(message);
+            }
+        }
+
+        private async Task HandleGambleCommand(SocketUserMessage message)
+        {
+            _stats.TotalGambles++;
+
+            bool win = _random.Next(2) == 1; // 50% chance to win
+
+            if (win)
+            {
+                await message.ReplyAsync("You win!");
+                _stats.TotalWins++;
+
+                // Update user stats
+                if (!_stats.UserStats.ContainsKey(message.Author.Id.ToString()))
+                {
+                    _stats.UserStats[message.Author.Id.ToString()] = new UserStat();
+                }
+                _stats.UserStats[message.Author.Id.ToString()].Wins++;
+            }
+            else
+            {
+                await message.ReplyAsync("You lose!");
+                _stats.TotalLosses++;
+
+                // Update user stats
+                if (!_stats.UserStats.ContainsKey(message.Author.Id.ToString()))
+                {
+                    _stats.UserStats[message.Author.Id.ToString()] = new UserStat();
+                }
+                _stats.UserStats[message.Author.Id.ToString()].Losses++;
+            }
+
+            SaveStats();
+        }
+
+        private void LoadOrCreateConfig()
+        {
+            if (File.Exists(_configPath))
+            {
+                string json = File.ReadAllText(_configPath);
+                _config = JsonConvert.DeserializeObject<BotConfig>(json);
+            }
+            else
+            {
+                _config = new BotConfig
+                {
+                    Token = "", // Empty by default
+                    CommandPrefix = "."
+                };
+                SaveConfig();
+            }
+        }
+
+        private void SaveConfig()
+        {
+            string json = JsonConvert.SerializeObject(_config, Formatting.Indented);
+            File.WriteAllText(_configPath, json);
+        }
+
+        private void LoadOrCreateStats()
+        {
+            if (File.Exists(_statsPath))
+            {
+                string json = File.ReadAllText(_statsPath);
+                _stats = JsonConvert.DeserializeObject<GamblingStats>(json);
+            }
+            else
+            {
+                _stats = new GamblingStats();
+                SaveStats();
+            }
+        }
+
+        private void SaveStats()
+        {
+            string json = JsonConvert.SerializeObject(_stats, Formatting.Indented);
+            File.WriteAllText(_statsPath, json);
+        }
+    }
+
+    public class BotConfig
+    {
+        public string Token { get; set; }
+        public string CommandPrefix { get; set; }
+    }
+
+    public class GamblingStats
+    {
+        public int TotalGambles { get; set; } = 0;
+        public int TotalWins { get; set; } = 0;
+        public int TotalLosses { get; set; } = 0;
+        public Dictionary<string, UserStat> UserStats { get; set; } = new Dictionary<string, UserStat>();
+    }
+
+    public class UserStat
+    {
+        public int Wins { get; set; } = 0;
+        public int Losses { get; set; } = 0;
+    }
+}
